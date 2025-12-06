@@ -22,6 +22,7 @@ from transformers import AutoTokenizer, AutoModel
 from scipy.stats import pearsonr, spearmanr, kendalltau
 from sklearn.metrics import mean_absolute_error, f1_score, accuracy_score, precision_score, recall_score
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 
 # ---------------------------------------------------------
@@ -73,13 +74,25 @@ class SpecificityDataset(Dataset):
 # Model - WITH SIGMOID for binary classification and refactored for MixText
 # ---------------------------------------------------------
 class RobertaBinaryClassifier(nn.Module):
-    def __init__(self):
+    def __init__(self, num_frozen_layers=0):
         super().__init__()
         self.encoder = AutoModel.from_pretrained("distilroberta-base")
         self.hidden = nn.Linear(768, 256)
         self.act = nn.ReLU()
         self.regressor = nn.Linear(256, 1)
         self.sigmoid = nn.Sigmoid()
+
+        # Freeze embeddings and specified number of layers
+        if num_frozen_layers > 0:
+            print(f"Freezing embeddings and first {num_frozen_layers} encoder layers.")
+            # Freeze embeddings
+            for param in self.encoder.embeddings.parameters():
+                param.requires_grad = False
+            
+            # Freeze encoder layers
+            for i in range(num_frozen_layers):
+                for param in self.encoder.encoder.layer[i].parameters():
+                    param.requires_grad = False
 
     def forward_encoder(self, input_ids, attention_mask):
         """Extracts the [CLS] token's hidden state."""
@@ -106,6 +119,11 @@ def update_teacher(student, teacher, alpha=0.999):
         for t_param, s_param in zip(teacher.parameters(), student.parameters()):
             t_param.data.mul_(alpha).add_(s_param.data, alpha=1 - alpha)
 
+def set_dropout_to_train_mode(model):
+    """Recursively sets dropout layers to train mode within a model."""
+    for module in model.modules():
+        if isinstance(module, nn.Dropout):
+            module.train()
 
 # ---------------------------------------------------------
 # Training Loop
@@ -113,6 +131,7 @@ def update_teacher(student, teacher, alpha=0.999):
 def train_epoch(student_model, teacher_model, loader, optimizer, loss_fn, device, args):
     student_model.train()
     teacher_model.eval()
+    set_dropout_to_train_mode(teacher_model) # Ensure dropout is active for teacher's forward pass
 
     losses = []
 
@@ -175,22 +194,32 @@ def train_epoch(student_model, teacher_model, loader, optimizer, loss_fn, device
 # ---------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------
-def evaluate(model, loader, device, threshold=0.5):
+def evaluate(model, loader, loss_fn, device, threshold=0.5):
     model.eval()
     preds_all, labels_all = [], []
+    val_losses = []
 
     with torch.no_grad():
         for batch in loader:
             input_ids = batch["input_ids"].to(device)
             mask = batch["attention_mask"].to(device)
-            labels = batch["label"].cpu().numpy()
+            labels = batch["label"].to(device)
 
-            preds = model(input_ids, mask).cpu().numpy()
-            preds_all.extend(preds)
-            labels_all.extend(labels)
+            preds = model(input_ids, mask)
+            
+            # Calculate validation loss
+            loss = loss_fn(preds, labels)
+            val_losses.append(loss.item())
+            
+            # Store preds and labels for metrics
+            preds_all.extend(preds.cpu().numpy())
+            labels_all.extend(labels.cpu().numpy())
 
     preds_all = np.array(preds_all)
     labels_all = np.array(labels_all)
+    
+    # Calculate average validation loss
+    val_loss = np.mean(val_losses)
     
     # Binary classification metrics
     preds_binary = (preds_all > threshold).astype(int)
@@ -206,7 +235,7 @@ def evaluate(model, loader, device, threshold=0.5):
     recall = recall_score(labels_binary, preds_binary, zero_division=0)
     f1 = f1_score(labels_binary, preds_binary, zero_division=0)
 
-    return mse, mae, accuracy, precision, recall, f1
+    return val_loss, mse, mae, accuracy, precision, recall, f1
 
 
 # ---------------------------------------------------------
@@ -227,6 +256,8 @@ def main():
     # MixText arguments
     parser.add_argument("--use_mixtext", action="store_true", help="Enable MixText data augmentation")
     parser.add_argument("--mix_alpha", type=float, default=0.2, help="Alpha parameter for the Beta distribution in MixText")
+    parser.add_argument("--save_plot", action="store_true", help="Save a plot of training and validation loss")
+    parser.add_argument("--num_frozen_layers", type=int, default=0, help="Number of initial RoBERTa layers to freeze")
 
     args, _ = parser.parse_known_args()
 
@@ -252,8 +283,8 @@ def main():
     valid_loader = DataLoader(valid_data, batch_size=args.batch_size)
     
     # Create models
-    model = RobertaBinaryClassifier().to(device)
-    teacher_model = RobertaBinaryClassifier().to(device)
+    model = RobertaBinaryClassifier(num_frozen_layers=args.num_frozen_layers).to(device)
+    teacher_model = RobertaBinaryClassifier(num_frozen_layers=args.num_frozen_layers).to(device)
     teacher_model.load_state_dict(model.state_dict())
 
     for p in teacher_model.parameters():
@@ -263,6 +294,8 @@ def main():
     loss_fn = nn.BCELoss()  # Binary Cross-Entropy Loss
 
     best_f1 = -1
+    train_loss_history = []
+    val_loss_history = []
 
     print(f"\nTraining for {args.epochs} epochs...")
     print(f"Using BCELoss + Sigmoid activation")
@@ -275,13 +308,17 @@ def main():
         train_loss = train_epoch(
             model, teacher_model, train_loader, optimizer, loss_fn, device, args
         )
-        mse, mae, accuracy, precision, recall, f1 = evaluate(
-            model, valid_loader, device, threshold=args.threshold
+        val_loss, mse, mae, accuracy, precision, recall, f1 = evaluate(
+            model, valid_loader, loss_fn, device, threshold=args.threshold
         )
+        
+        train_loss_history.append(train_loss)
+        val_loss_history.append(val_loss)
 
         print(
             f"Epoch {epoch:2d} | "
-            f"Loss = {train_loss:.4f} | "
+            f"Train Loss = {train_loss:.4f} | "
+            f"Val Loss = {val_loss:.4f} | "
             f"Acc = {accuracy:.4f} | "
             f"P = {precision:.4f} | "
             f"R = {recall:.4f} | "
@@ -296,6 +333,26 @@ def main():
     print("-" * 80)
     print(f"Training complete! Best F1: {best_f1:.4f}")
     print(f"Model saved to: {args.save_path}")
+
+    # Plot and save the loss curve if requested
+    if args.save_plot:
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(1, args.epochs + 1), train_loss_history, label="Training Loss")
+        plt.plot(range(1, args.epochs + 1), val_loss_history, label="Validation Loss")
+        plt.title("Training and Validation Loss Over Epochs")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.legend()
+        plt.grid(True)
+        
+        # Create a dynamic filename
+        mix_str = f"_mixalpha_{args.mix_alpha}" if args.use_mixtext else ""
+        plot_filename = f"loss_curve_lr_{args.lr}_cw_{args.consistency_weight}{mix_str}.png"
+        
+        plt.savefig(plot_filename)
+        print(f"Loss curve saved to: {plot_filename}")
+
+
 
 
 if __name__ == "__main__":
