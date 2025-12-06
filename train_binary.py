@@ -4,11 +4,12 @@ train_binary.py - Training script for BINARY classification tasks
 Modified from train.py to use:
 - Sigmoid activation (outputs bounded to [0, 1])
 - BCELoss (Binary Cross-Entropy) instead of MSELoss
+- Optional MixText data augmentation
 
 Use this for datasets with binary labels (0 or 1) like PBSDS.
 
 Usage:
-    python train_binary.py --train_path train_PBSDS.tsv --valid_path valid_PBSDS.tsv --epochs 10
+    python train_binary.py --train_path train_PBSDS.tsv --valid_path valid_PBSDS.tsv --epochs 10 --use_mixtext
 """
 
 import os
@@ -69,7 +70,7 @@ class SpecificityDataset(Dataset):
 
 
 # ---------------------------------------------------------
-# Model - WITH SIGMOID for binary classification
+# Model - WITH SIGMOID for binary classification and refactored for MixText
 # ---------------------------------------------------------
 class RobertaBinaryClassifier(nn.Module):
     def __init__(self):
@@ -78,15 +79,25 @@ class RobertaBinaryClassifier(nn.Module):
         self.hidden = nn.Linear(768, 256)
         self.act = nn.ReLU()
         self.regressor = nn.Linear(256, 1)
-        self.sigmoid = nn.Sigmoid()  # ADD SIGMOID
+        self.sigmoid = nn.Sigmoid()
+
+    def forward_encoder(self, input_ids, attention_mask):
+        """Extracts the [CLS] token's hidden state."""
+        outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        cls_hidden_state = outputs.last_hidden_state[:, 0, :]
+        return cls_hidden_state
+
+    def forward_classifier(self, cls_hidden_state):
+        """Takes a hidden state and produces a final prediction."""
+        x = self.act(self.hidden(cls_hidden_state))
+        out = self.regressor(x)
+        out = self.sigmoid(out)
+        return out.squeeze(1)
 
     def forward(self, input_ids, attention_mask):
-        outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        cls = outputs.last_hidden_state[:, 0, :]
-        x = self.act(self.hidden(cls))
-        out = self.regressor(x)
-        out = self.sigmoid(out)  # Apply sigmoid to bound output to [0, 1]
-        return out.squeeze(1)
+        """Standard forward pass."""
+        cls_hidden_state = self.forward_encoder(input_ids, attention_mask)
+        return self.forward_classifier(cls_hidden_state)
 
 
 # function to update the teacher network
@@ -99,7 +110,7 @@ def update_teacher(student, teacher, alpha=0.999):
 # ---------------------------------------------------------
 # Training Loop
 # ---------------------------------------------------------
-def train_epoch(student_model, teacher_model, loader, optimizer, loss_fn, device, consistency_weight=10.0):
+def train_epoch(student_model, teacher_model, loader, optimizer, loss_fn, device, args):
     student_model.train()
     teacher_model.eval()
 
@@ -112,21 +123,43 @@ def train_epoch(student_model, teacher_model, loader, optimizer, loss_fn, device
 
         optimizer.zero_grad()
 
-        # Student forward
+        # Student forward for supervised and consistency loss
         student_preds = student_model(input_ids, mask)
-
-        # Supervised loss (BCE for binary classification)
         supervised_loss = loss_fn(student_preds, labels)
 
-        # Teacher forward (no grad)
+        # Teacher forward (no grad) for consistency loss
         with torch.no_grad():
             teacher_preds = teacher_model(input_ids, mask)
-
-        # Consistency loss = MSE(student, teacher)
         consistency_loss = nn.MSELoss()(student_preds, teacher_preds)
 
-        # Combine
-        loss = supervised_loss + consistency_weight * consistency_loss
+        # Base loss
+        loss = supervised_loss + args.consistency_weight * consistency_loss
+
+        # --- MixText Augmentation ---
+        if args.use_mixtext:
+            # Get hidden states from the student model
+            hidden_1 = student_model.forward_encoder(input_ids, mask)
+
+            # Create a shuffled version of the batch to mix with
+            batch_size = input_ids.size(0)
+            shuffle_indices = torch.randperm(batch_size)
+            input_ids_2 = input_ids[shuffle_indices]
+            mask_2 = mask[shuffle_indices]
+            labels_2 = labels[shuffle_indices]
+
+            hidden_2 = student_model.forward_encoder(input_ids_2, mask_2)
+
+            # Generate mixing lambda and mix hidden states and labels
+            lam = np.random.beta(args.mix_alpha, args.mix_alpha)
+            mixed_hidden = lam * hidden_1 + (1 - lam) * hidden_2
+            mixed_labels = lam * labels + (1 - lam) * labels_2
+
+            # Get predictions on the mixed hidden state
+            mixed_preds = student_model.forward_classifier(mixed_hidden)
+            
+            # Calculate MixText loss and add it to the total loss
+            mix_loss = loss_fn(mixed_preds, mixed_labels)
+            loss = loss + mix_loss
 
         loss.backward()
         optimizer.step()
@@ -191,13 +224,17 @@ def main():
     parser.add_argument("--save_path", type=str, default="best_model.pt")
     parser.add_argument("--threshold", type=float, default=0.5,
                         help="Threshold for binary classification")
+    # MixText arguments
+    parser.add_argument("--use_mixtext", action="store_true", help="Enable MixText data augmentation")
+    parser.add_argument("--mix_alpha", type=float, default=0.2, help="Alpha parameter for the Beta distribution in MixText")
+
     args, _ = parser.parse_known_args()
 
     # Device
     if torch.cuda.is_available():
         device = "cuda"
-    elif torch.backends.mps.is_available():
-        device = "mps"
+    # elif torch.backends.mps.is_available():
+    #     device = "mps"
     else:
         device = "cpu"
     print(f"Using device: {device}")
@@ -229,13 +266,14 @@ def main():
 
     print(f"\nTraining for {args.epochs} epochs...")
     print(f"Using BCELoss + Sigmoid activation")
+    if args.use_mixtext:
+        print(f"Using MixText augmentation with alpha = {args.mix_alpha}")
     print(f"Threshold: {args.threshold}")
     print("-" * 80)
 
     for epoch in range(1, args.epochs + 1):
         train_loss = train_epoch(
-            model, teacher_model, train_loader, optimizer, loss_fn, device,
-            consistency_weight=args.consistency_weight
+            model, teacher_model, train_loader, optimizer, loss_fn, device, args
         )
         mse, mae, accuracy, precision, recall, f1 = evaluate(
             model, valid_loader, device, threshold=args.threshold
