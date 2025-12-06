@@ -28,7 +28,7 @@ Linear(768 → 256) → ReLU → Linear(256 → 1)
 
 Outputs a real-valued specificity score.
 
-### 3. Self-Ensembling Framework (Required)
+### 3. Self-Ensembling Framework
 
 The training loop includes the full Self-Ensembling mechanism:
 
