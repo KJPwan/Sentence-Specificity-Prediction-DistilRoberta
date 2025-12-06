@@ -18,6 +18,8 @@ def create_subsets(input_file="train_PBSDS.tsv", output_prefix="train_pbsds"):
 
     total_rows = len(df)
     subsets = {
+        "1": int(total_rows * 0.01),
+        "2_5": int(total_rows * 0.025),
         "10": int(total_rows * 0.10),
         "25": int(total_rows * 0.25),
         "50": int(total_rows * 0.50)
