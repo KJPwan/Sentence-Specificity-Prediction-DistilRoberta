@@ -7,7 +7,7 @@ BATCH_SIZE=8
 LEARNING_RATE=2e-5
 FROZEN_LAYERS=4
 MIX_ALPHA=0.2
-EPOCHS=3 # Using 3 epochs for faster iteration
+EPOCHS=10 # Using 10 epochs for a more robust result per run
 
 # --- Experiment Setup ---
 PERCENTAGES=(1 2_5 10 25 100)
