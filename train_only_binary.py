@@ -10,9 +10,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel
-from scipy.stats import pearsonr
 from transformers import AutoTokenizer
-from scipy.stats import pearsonr, spearmanr, kendalltau
 from sklearn.metrics import mean_absolute_error
 from sklearn.metrics import mean_absolute_error, f1_score, accuracy_score, precision_score, recall_score
 
@@ -72,6 +70,7 @@ class RobertaBinaryClassifier(nn.Module):
         self.hidden = nn.Linear(768, 256)
         self.act = nn.ReLU()
         self.regressor = nn.Linear(256, 1)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, input_ids, attention_mask):
         outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
